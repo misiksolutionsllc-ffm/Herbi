@@ -90,6 +90,19 @@ If any of those fail, check the terminal running `pnpm stripe:listen` — it pri
 
 ## 5. Push to GitHub → Deploy to Vercel (5 min)
 
+> **Automated deploys:** `.github/workflows/deploy.yml` runs on every push to
+> `main`. It applies Supabase migrations via `psql` and deploys to Vercel
+> production via `vercel deploy --prebuilt --prod`. Configure these four
+> **GitHub repo secrets** (Settings → Secrets and variables → Actions):
+> - `SUPABASE_DB_URL` — `postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres`
+> - `VERCEL_TOKEN` — from https://vercel.com/account/tokens
+> - `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — from `.vercel/project.json` after
+>   `npx vercel link` locally, or from the Vercel project URL/settings.
+>
+> App runtime env (Supabase keys, Stripe keys, etc.) still belong in the
+> **Vercel project** Environment Variables — `vercel pull` picks them up.
+
+
 ```bash
 git init
 git add .
