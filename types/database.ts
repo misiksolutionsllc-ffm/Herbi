@@ -67,6 +67,10 @@ export type Database = {
         Args: { p_slug: string; p_qty: number };
         Returns: Product;
       };
+      decrement_stock_batch: {
+        Args: { p_items: Json };
+        Returns: Product[];
+      };
     };
     Enums: Record<string, never>;
     CompositeTypes: Record<string, never>;

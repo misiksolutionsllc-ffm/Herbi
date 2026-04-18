@@ -36,36 +36,27 @@ export async function POST(req: NextRequest) {
   const session = event.data.object as Stripe.Checkout.Session;
   const supabase = createAdminClient();
 
-  // Reconstruct cart from session metadata
-  let cart: Array<{ slug: string; quantity: number }> = [];
-  try {
-    cart = JSON.parse(session.metadata?.cart ?? "[]");
-  } catch {
-    console.error("[stripe webhook] could not parse cart metadata");
-    return NextResponse.json({ error: "bad metadata" }, { status: 400 });
-  }
+  // Rebuild the cart directly from Stripe's line items. The slug we stamped
+  // on each line's product_data.metadata at checkout time is the only place
+  // we need to read — no session.metadata parsing, no 500-char limit.
+  const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
+    expand: ["line_items.data.price.product"],
+  });
 
-  // Fetch authoritative product data for the order snapshot
-  const slugs = cart.map((c) => c.slug);
-  const { data: products, error: prodErr } = await supabase
-    .from("products")
-    .select("slug, name, price_cents")
-    .in("slug", slugs);
-
-  if (prodErr || !products) {
-    console.error("[stripe webhook] product lookup failed:", prodErr);
-    return NextResponse.json({ error: "product lookup" }, { status: 500 });
-  }
-
-  const orderItems = cart.map((line) => {
-    const p = products.find((pr) => pr.slug === line.slug);
+  const orderItems = (fullSession.line_items?.data ?? []).map((li) => {
+    const product = li.price?.product as Stripe.Product | undefined;
     return {
-      slug: line.slug,
-      name: p?.name ?? line.slug,
-      quantity: line.quantity,
-      unit_amount: p?.price_cents ?? 0,
+      slug: product?.metadata?.slug ?? "",
+      name: product?.name ?? "",
+      quantity: li.quantity ?? 0,
+      unit_amount: li.price?.unit_amount ?? 0,
     };
   });
+
+  if (orderItems.some((i) => !i.slug)) {
+    console.error("[stripe webhook] line item missing slug metadata");
+    return NextResponse.json({ error: "bad line items" }, { status: 400 });
+  }
 
   // Extract shipping details defensively — field location varies by API version
   const sessionAny = session as unknown as {
@@ -110,19 +101,22 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true, duplicate: true });
   }
 
-  // Atomic stock decrement — only runs for first successful insert
-  for (const line of cart) {
-    const { error: stockErr } = await supabase.rpc("decrement_stock", {
-      p_slug: line.slug,
-      p_qty: line.quantity,
-    });
-    if (stockErr) {
-      // Log but don't fail the webhook — order is recorded, stock can be reconciled
-      console.error(
-        `[stripe webhook] stock decrement failed for ${line.slug}:`,
-        stockErr.message
-      );
-    }
+  // Atomic batch stock decrement — the RPC wraps every line in a single
+  // transaction, so either every line's stock is decremented or none are.
+  // Prevents partially-updated inventory if one item is out of stock between
+  // checkout and webhook delivery.
+  const { error: stockErr } = await supabase.rpc("decrement_stock_batch", {
+    p_items: orderItems.map((i) => ({ slug: i.slug, qty: i.quantity })),
+  });
+
+  if (stockErr) {
+    // Payment succeeded at Stripe and the order row is in place, so we
+    // still 200. A human needs to reconcile stock — log distinctively so
+    // it can be grepped from the order id.
+    console.error(
+      `[stripe webhook] RECONCILE order=${inserted?.id} stock decrement failed:`,
+      stockErr.message
+    );
   }
 
   console.log(`[stripe webhook] order ${inserted?.id} recorded`);
