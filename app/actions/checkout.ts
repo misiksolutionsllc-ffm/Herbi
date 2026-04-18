@@ -12,8 +12,13 @@ export async function createCheckoutSession(input: CheckoutInput) {
     return { error: "Invalid cart." };
   }
 
-  const { items } = parsed.data;
-  const slugs = items.map((i) => i.slug);
+  // Aggregate quantities by slug — guards against duplicate cart lines
+  // slipping past the per-line stock check.
+  const totals = new Map<string, number>();
+  for (const item of parsed.data.items) {
+    totals.set(item.slug, (totals.get(item.slug) ?? 0) + item.quantity);
+  }
+  const slugs = [...totals.keys()];
 
   // 2. Re-fetch products from DB (NEVER trust client prices)
   const supabase = await createClient();
@@ -26,22 +31,30 @@ export async function createCheckoutSession(input: CheckoutInput) {
     return { error: "Could not verify cart." };
   }
 
-  // 3. Build Stripe line items from authoritative DB data
+  // 3. Build Stripe line items from authoritative DB data.
+  // Slug is tagged on each line's product_data.metadata so the webhook can
+  // rebuild the cart by expanding line_items.data.price.product — this keeps
+  // us under Stripe's 500-char session.metadata value limit regardless of
+  // cart size.
   const lineItems: Array<{
     price_data: {
       currency: string;
       unit_amount: number;
-      product_data: { name: string; images?: string[] };
+      product_data: {
+        name: string;
+        images?: string[];
+        metadata: { slug: string };
+      };
     };
     quantity: number;
   }> = [];
 
-  for (const item of items) {
-    const p = products.find((pr) => pr.slug === item.slug);
+  for (const [slug, quantity] of totals) {
+    const p = products.find((pr) => pr.slug === slug);
     if (!p || !p.is_active) {
-      return { error: `Product unavailable: ${item.slug}` };
+      return { error: `Product unavailable: ${slug}` };
     }
-    if (p.stock_level < item.quantity) {
+    if (p.stock_level < quantity) {
       return { error: `Not enough stock for ${p.name}.` };
     }
     lineItems.push({
@@ -51,9 +64,10 @@ export async function createCheckoutSession(input: CheckoutInput) {
         product_data: {
           name: p.name,
           images: p.images.slice(0, 1),
+          metadata: { slug },
         },
       },
-      quantity: item.quantity,
+      quantity,
     });
   }
 
@@ -68,12 +82,6 @@ export async function createCheckoutSession(input: CheckoutInput) {
     shipping_address_collection: { allowed_countries: ["US", "CA"] },
     billing_address_collection: "required",
     automatic_tax: { enabled: false },
-    metadata: {
-      // Snapshot the authoritative cart so the webhook can rebuild items
-      cart: JSON.stringify(
-        items.map((i) => ({ slug: i.slug, quantity: i.quantity }))
-      ),
-    },
   });
 
   if (!session.url) {
