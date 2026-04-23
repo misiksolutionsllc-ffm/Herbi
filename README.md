@@ -90,17 +90,34 @@ If any of those fail, check the terminal running `pnpm stripe:listen` — it pri
 
 ## 5. Push to GitHub → Deploy to Vercel (5 min)
 
-> **Automated deploys:** `.github/workflows/deploy.yml` runs on every push to
-> `main`. It applies Supabase migrations via `psql` and deploys to Vercel
-> production via `vercel deploy --prebuilt --prod`. Configure these four
-> **GitHub repo secrets** (Settings → Secrets and variables → Actions):
-> - `SUPABASE_DB_URL` — `postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres`
-> - `VERCEL_TOKEN` — from https://vercel.com/account/tokens
-> - `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — from `.vercel/project.json` after
->   `npx vercel link` locally, or from the Vercel project URL/settings.
->
-> App runtime env (Supabase keys, Stripe keys, etc.) still belong in the
-> **Vercel project** Environment Variables — `vercel pull` picks them up.
+Three ways to deploy — pick one.
+
+### Option A — one command on your laptop
+
+With `.env.local` filled from §2–§3 (add `SUPABASE_DB_PASSWORD` too):
+
+```bash
+chmod +x scripts/deploy.sh   # first time only
+./scripts/deploy.sh
+```
+
+Applies migrations via `psql`, pushes env vars to Vercel, deploys production,
+creates the Stripe webhook, redeploys with the webhook secret, and smoke-tests
+the URL. Idempotent. Phase flags: `--migrate`, `--deploy`, `--smoke-only`.
+
+### Option B — automated on every push to `main`
+
+`.github/workflows/deploy.yml` runs migrations + deploys on every push.
+Configure these **GitHub repo secrets** (Settings → Secrets and variables → Actions):
+- `SUPABASE_DB_URL` — `postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres`
+- `VERCEL_TOKEN` — from https://vercel.com/account/tokens
+- `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — from `.vercel/project.json` after
+  `npx vercel link` locally.
+
+App runtime env (Supabase + Stripe keys) goes in the **Vercel project**
+Environment Variables; `vercel pull` fetches them during the build.
+
+### Option C — manual click-through (original flow below)
 
 
 ```bash
