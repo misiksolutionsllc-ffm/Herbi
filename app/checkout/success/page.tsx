@@ -17,8 +17,14 @@ export default async function SuccessPage({
   if (session_id) {
     try {
       const session = await stripe.checkout.sessions.retrieve(session_id);
-      email = session.customer_details?.email ?? null;
-      amount = session.amount_total;
+      // Only surface customer PII for sessions that actually paid.
+      // Stripe session IDs are high-entropy but can leak via referrer
+      // headers, access logs, or shared URLs — gating on payment_status
+      // prevents revealing the email on abandoned/expired sessions.
+      if (session.payment_status === "paid") {
+        email = session.customer_details?.email ?? null;
+        amount = session.amount_total;
+      }
     } catch {
       // bad session id — just show generic thank you
     }
