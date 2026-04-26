@@ -3,7 +3,8 @@ import { headers } from "next/headers";
 import type Stripe from "stripe";
 import { stripe } from "@/lib/stripe";
 import { createAdminClient } from "@/lib/supabase/admin";
-import type { Json } from "@/types/database";
+import { routeOrderToSupplier } from "@/lib/order-router";
+import type { Json, OrderItem } from "@/types/database";
 
 export const runtime = "nodejs"; // Stripe SDK needs Node runtime
 
@@ -36,29 +37,29 @@ export async function POST(req: NextRequest) {
   const session = event.data.object as Stripe.Checkout.Session;
   const supabase = createAdminClient();
 
-  // Rebuild the cart directly from Stripe's line items. The slug we stamped
-  // on each line's product_data.metadata at checkout time is the only place
-  // we need to read — no session.metadata parsing, no 500-char limit.
+  // Rebuild the cart from Stripe line items (slug stamped in product_data.metadata)
   const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
     expand: ["line_items.data.price.product"],
   });
 
-  const orderItems = (fullSession.line_items?.data ?? []).map((li) => {
-    const product = li.price?.product as Stripe.Product | undefined;
-    return {
-      slug: product?.metadata?.slug ?? "",
-      name: product?.name ?? "",
-      quantity: li.quantity ?? 0,
-      unit_amount: li.price?.unit_amount ?? 0,
-    };
-  });
+  const orderItems: OrderItem[] = (fullSession.line_items?.data ?? []).map(
+    (li) => {
+      const product = li.price?.product as Stripe.Product | undefined;
+      return {
+        slug: product?.metadata?.slug ?? "",
+        name: product?.name ?? "",
+        quantity: li.quantity ?? 0,
+        unit_amount: li.price?.unit_amount ?? 0,
+      };
+    }
+  );
 
   if (orderItems.some((i) => !i.slug)) {
     console.error("[stripe webhook] line item missing slug metadata");
     return NextResponse.json({ error: "bad line items" }, { status: 400 });
   }
 
-  // Extract shipping details defensively — field location varies by API version
+  // Extract shipping address defensively across API versions
   const sessionAny = session as unknown as {
     shipping_details?: unknown;
     collected_information?: { shipping_details?: unknown };
@@ -90,7 +91,7 @@ export async function POST(req: NextRequest) {
     .select("id")
     .single();
 
-  // 23505 = unique_violation (duplicate delivery of same event)
+  // 23505 = unique_violation (duplicate webhook delivery)
   if (insertErr && insertErr.code !== "23505") {
     console.error("[stripe webhook] order insert failed:", insertErr);
     return NextResponse.json({ error: "insert failed" }, { status: 500 });
@@ -101,22 +102,33 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true, duplicate: true });
   }
 
-  // Atomic batch stock decrement — the RPC wraps every line in a single
-  // transaction, so either every line's stock is decremented or none are.
-  // Prevents partially-updated inventory if one item is out of stock between
-  // checkout and webhook delivery.
+  // Atomic batch stock decrement
   const { error: stockErr } = await supabase.rpc("decrement_stock_batch", {
     p_items: orderItems.map((i) => ({ slug: i.slug, qty: i.quantity })),
   });
 
   if (stockErr) {
-    // Payment succeeded at Stripe and the order row is in place, so we
-    // still 200. A human needs to reconcile stock — log distinctively so
-    // it can be grepped from the order id.
     console.error(
       `[stripe webhook] RECONCILE order=${inserted?.id} stock decrement failed:`,
       stockErr.message
     );
+  }
+
+  // Route order to wholesale supplier (intermediary platform core step)
+  if (inserted?.id) {
+    const { supplierId, error: routeErr } = await routeOrderToSupplier(
+      inserted.id,
+      orderItems
+    );
+    if (routeErr) {
+      console.warn(
+        `[stripe webhook] order=${inserted.id} routing warning: ${routeErr}`
+      );
+    } else {
+      console.log(
+        `[stripe webhook] order ${inserted.id} routed to supplier ${supplierId}`
+      );
+    }
   }
 
   console.log(`[stripe webhook] order ${inserted?.id} recorded`);
