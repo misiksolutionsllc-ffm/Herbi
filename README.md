@@ -33,7 +33,12 @@ Leave `.env.local` empty for now — we'll fill it in as we provision services.
 
 1. Create a new project at [supabase.com/dashboard](https://supabase.com/dashboard/projects). Pick a strong DB password and the region closest to your customers.
 2. Wait for it to spin up (~2 min).
-3. Go to **SQL Editor → New query**. Paste the contents of `supabase/migrations/0001_init.sql`. Run. Then do the same with `0002_seed.sql`. You should see 6 products in **Table Editor → products**.
+3. Go to **SQL Editor → New query**. Run each migration file in order:
+   - `supabase/migrations/0001_init.sql` — products, orders, stock function, RLS
+   - `supabase/migrations/0002_seed.sql` — 6 seed products
+   - `supabase/migrations/0003_decrement_stock_batch.sql` — atomic batch stock decrement
+   - `supabase/migrations/0004_intermediary_platform.sql` — suppliers, supplier\_orders, platform\_metrics\_daily view
+   - `supabase/migrations/0005_seed_suppliers.sql` — 2 seed wholesale suppliers + product links
 4. Go to **Project Settings → API**. Copy these into `.env.local`:
 
 ```
@@ -82,9 +87,12 @@ Check:
 - Redirect back to `/checkout/success` ✅
 - `orders` table in Supabase has a new row with `status = 'paid'` ✅
 - `products.stock_level` for the item you bought decreased by the quantity ✅
+- `supplier_orders` table has a new row routing the order to a wholesale supplier ✅
 - Cart is empty ✅
 
 If any of those fail, check the terminal running `pnpm stripe:listen` — it prints every webhook delivery and response code.
+
+Admin dashboard: `http://localhost:3000/admin`
 
 ---
 
@@ -101,7 +109,7 @@ chmod +x scripts/deploy.sh   # first time only
 ./scripts/deploy.sh
 ```
 
-Applies migrations via `psql`, pushes env vars to Vercel, deploys production,
+Applies all 5 migrations via `psql`, pushes env vars to Vercel, deploys production,
 creates the Stripe webhook, redeploys with the webhook secret, and smoke-tests
 the URL. Idempotent. Phase flags: `--migrate`, `--deploy`, `--smoke-only`.
 
@@ -117,28 +125,20 @@ Configure these **GitHub repo secrets** (Settings → Secrets and variables → 
 App runtime env (Supabase + Stripe keys) goes in the **Vercel project**
 Environment Variables; `vercel pull` fetches them during the build.
 
-### Option C — manual click-through (original flow below)
-
+### Option C — manual click-through
 
 ```bash
 git init
 git add .
 git commit -m "Initial Herbi commit"
-gh repo create herbi --private --source=. --push   # or push via GitHub UI
+gh repo create herbi --private --source=. --push
 ```
 
 Then on Vercel:
 
 1. **Add New → Project** → pick the `herbi` repo.
 2. Framework preset: Next.js (auto-detected).
-3. Under **Environment Variables**, add every key from `.env.example` (filled in with your real values). Mark these as **Production** + **Preview** + **Development**:
-   - `NEXT_PUBLIC_SITE_URL` — set to `https://<your-vercel-url>` (update later if you attach a custom domain)
-   - `NEXT_PUBLIC_SUPABASE_URL`
-   - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-   - `STRIPE_SECRET_KEY`
-   - `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`
-   - `STRIPE_WEBHOOK_SECRET` *(fill in after step 6)*
+3. Under **Environment Variables**, add every key from `.env.example`.
 4. **Deploy**.
 
 ---
@@ -151,57 +151,103 @@ Once Vercel gives you a URL (e.g. `herbi-abc123.vercel.app`):
 2. Endpoint URL: `https://<your-vercel-url>/api/webhooks/stripe`
 3. Events to send: `checkout.session.completed`
 4. Add endpoint → click it → **Reveal signing secret** → copy
-5. Back in Vercel → Project Settings → Environment Variables → update `STRIPE_WEBHOOK_SECRET` with the new value
-6. Redeploy (Vercel → Deployments → latest → Redeploy, or push any commit)
-
-Then do one real test checkout on the live URL. Confirm an order appears in Supabase.
+5. Back in Vercel → Project Settings → Environment Variables → update `STRIPE_WEBHOOK_SECRET`
+6. Redeploy
 
 ---
 
-## 7. Custom domain (optional, 5 min)
+## 7. Custom domain (optional)
 
-1. Vercel → Project Settings → Domains → Add `herbi.shop` (or whatever)
-2. Follow DNS instructions (A/CNAME records at your registrar)
-3. Once active, update `NEXT_PUBLIC_SITE_URL` env var to the new domain, and update the Stripe webhook URL to match
+1. Vercel → Project Settings → Domains → Add your domain
+2. Follow DNS instructions
+3. Update `NEXT_PUBLIC_SITE_URL` and the Stripe webhook URL
 4. Redeploy
 
 ---
 
 ## 8. Going live (flipping out of Stripe test mode)
 
-When you're ready:
-
 1. Stripe: toggle to **Live mode**. Grab new `sk_live_` / `pk_live_` keys.
-2. Create a new webhook endpoint in Live mode (same URL, new signing secret).
-3. In Vercel, update `STRIPE_SECRET_KEY`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET` to the live values.
+2. Create a new webhook endpoint in Live mode.
+3. In Vercel, update `STRIPE_SECRET_KEY`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`.
 4. Redeploy.
 
-Test with a real card and a small amount. Refund it yourself from the Stripe dashboard.
+---
+
+## AI-Powered Intermediary Platform
+
+This storefront operates as a **smart middleman** between customers and wholesale suppliers:
+
+```
+Customer → Herbi (your brand) → Wholesale Supplier → Customer
+```
+
+You never hold inventory. The platform handles pricing, order routing, and margin tracking automatically.
+
+### How it works
+
+1. **Product Aggregator** — Products in Supabase link to a `supplier_id` and carry `wholesale_cost_cents` alongside `price_cents` (your retail price).
+2. **Margin Engine** (`lib/margin-engine.ts`) — Calculates gross margin on every product. `suggestOptimalPrice(wholesaleCost, targetPct)` prices to hit a target margin. Supplier candidates ranked 60% cost / 40% reliability.
+3. **Order Router** (`lib/order-router.ts`) — After every successful Stripe checkout, the webhook automatically routes the order to the correct wholesale supplier by inserting a `supplier_orders` row and (optionally) calling the supplier's API.
+4. **Real-time Sync** (`POST /api/suppliers/sync`) — Suppliers call this endpoint to push live stock levels and updated wholesale costs. Bearer token auth, Zod-validated.
+5. **Analytics Dashboard** (`/admin`) — Tracks revenue, wholesale cost, gross profit, and margin % day-by-day. No inventory or warehouse needed — profit comes from the price difference.
+
+### Admin dashboard routes
+
+| Route | What it shows |
+|---|---|
+| `/admin` | Daily revenue, profit, margin %, supplier count, order count |
+| `/admin/suppliers` | All wholesale partners, per-supplier margin avg and reliability |
+| `/admin/orders` | Customer orders with routing status (unrouted / pending / shipped) |
+
+### API reference (server-only)
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/api/admin/metrics` | Last 30 days of platform metrics |
+| `GET / POST` | `/api/admin/suppliers` | List or create wholesale suppliers |
+| `POST` | `/api/suppliers/sync` | Supplier stock + cost sync (auth: Bearer) |
+
+> 🔒 Protect `/api/admin/*` and `/admin` behind auth middleware before going to production. See the [Next.js middleware docs](https://nextjs.org/docs/app/building-your-application/routing/middleware) for a simple session-based approach.
+
+### Money flow example
+
+```
+Customer pays    $34.00  (retail price)
+Platform pays    $23.80  (wholesale cost — 70% of retail)
+─────────────────────────
+Your profit      $10.20  (30% margin)
+```
+
+The `platform_metrics_daily` Supabase view aggregates these numbers automatically across all paid orders.
 
 ---
 
 ## Architecture notes
 
-- **Server-first rendering.** The homepage, shop, and PDPs all read from Supabase on the server. Cached 60s (`revalidate = 60`).
-- **Cart is local-first.** Zustand + localStorage. Persists across sessions, survives refresh. Never sent to the server until checkout.
-- **Checkout is server-authoritative.** The Server Action re-fetches product prices from Supabase before creating the Stripe session. Client-sent prices are never trusted.
+- **Server-first rendering.** Homepage, shop, and PDPs read from Supabase on the server. Cached 60s (`revalidate = 60`).
+- **Cart is local-first.** Zustand + localStorage. Never sent to the server until checkout.
+- **Checkout is server-authoritative.** Server Action re-fetches prices from Supabase before creating the Stripe session. Client-sent prices are never trusted.
 - **Webhook is idempotent.** Unique constraint on `stripe_session_id` + `ON CONFLICT` handling means Stripe retries can't create duplicate orders.
-- **Stock decrement is atomic.** A SECURITY DEFINER PL/pgSQL function with a `stock_level >= p_qty` guard prevents race conditions on the last unit.
-- **Service role is isolated.** Only the webhook route imports `lib/supabase/admin`. Everything else uses the anon-keyed, RLS-respecting server client.
+- **Stock decrement is atomic.** SECURITY DEFINER PL/pgSQL function with `stock_level >= p_qty` guard prevents race conditions.
+- **Order routing is non-blocking.** Supplier routing happens after the order insert; a routing failure logs a warning but never fails the webhook response.
+- **Service role is isolated.** Only `lib/supabase/admin.ts` imports the service role key, used only from the webhook and admin API routes.
 
 ## Operational checklist
 
+- [ ] All 5 Supabase migrations applied
 - [ ] Supabase daily backups enabled (Settings → Database → Backups)
-- [ ] Vercel analytics enabled for traffic + web vitals
-- [ ] Stripe email receipts configured (Settings → Emails)
+- [ ] Vercel analytics enabled
+- [ ] Stripe email receipts configured
 - [ ] Custom domain DNS verified with SSL active
-- [ ] `NEXT_PUBLIC_SITE_URL` matches your production domain exactly
-- [ ] First live-mode order placed, received confirmation, refunded cleanly
+- [ ] `NEXT_PUBLIC_SITE_URL` matches production domain exactly
+- [ ] First live-mode order placed, routed to supplier, confirmed in `/admin/orders`
+- [ ] `/api/admin/*` and `/admin` protected behind auth middleware
 
-## Next steps to consider
+## Next steps
 
-- Auth: add `/app/(auth)` routes using `@supabase/ssr` — the clients are already set up
-- Inventory admin: a protected `/admin` route with a simple products editor
-- Transactional email: swap Stripe's default receipts for something branded (Resend + React Email)
-- Search: Supabase full-text search on the `products` table
-- Analytics: PostHog or Plausible for conversion tracking
+- **Admin auth**: add NextAuth or Supabase Auth session check in a middleware protecting `/admin`
+- **Supplier notifications**: wire real supplier API endpoints in the `api_endpoint` column
+- **Product sync**: have suppliers call `POST /api/suppliers/sync` on a schedule
+- **Email**: Resend + React Email for branded order confirmations
+- **Analytics**: PostHog or Plausible for conversion tracking
