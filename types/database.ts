@@ -19,6 +19,8 @@ export type Product = {
   stock_level: number;
   metadata: Json;
   is_active: boolean;
+  wholesale_cost_cents: number | null;
+  supplier_id: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -45,6 +47,39 @@ export type Order = {
   shipping_address: Json | null;
 };
 
+export type Supplier = {
+  id: string;
+  name: string;
+  contact_email: string | null;
+  api_endpoint: string | null;
+  api_key_hash: string | null;
+  reliability_score: number;
+  is_active: boolean;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SupplierOrder = {
+  id: string;
+  order_id: string;
+  supplier_id: string;
+  status: "pending" | "confirmed" | "shipped" | "delivered" | "failed";
+  tracking_number: string | null;
+  routed_at: string;
+  confirmed_at: string | null;
+  shipped_at: string | null;
+  notes: string | null;
+};
+
+export type PlatformMetricsDay = {
+  day: string;
+  order_count: number;
+  revenue_cents: number;
+  wholesale_cost_cents: number;
+  profit_cents: number;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -60,8 +95,24 @@ export type Database = {
         Update: Partial<Omit<Order, "id" | "created_at">>;
         Relationships: [];
       };
+      suppliers: {
+        Row: Supplier;
+        Insert: Omit<Supplier, "id" | "created_at" | "updated_at">;
+        Update: Partial<Omit<Supplier, "id" | "created_at" | "updated_at">>;
+        Relationships: [];
+      };
+      supplier_orders: {
+        Row: SupplierOrder;
+        Insert: Omit<SupplierOrder, "id" | "routed_at">;
+        Update: Partial<Omit<SupplierOrder, "id" | "order_id" | "supplier_id">>;
+        Relationships: [];
+      };
     };
-    Views: Record<string, never>;
+    Views: {
+      platform_metrics_daily: {
+        Row: PlatformMetricsDay;
+      };
+    };
     Functions: {
       decrement_stock: {
         Args: { p_slug: string; p_qty: number };
